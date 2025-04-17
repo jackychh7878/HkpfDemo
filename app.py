@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 # ——— CONFIG ———
 WS_URL = "wss://portal-demo.fano.ai/speech/streaming-recognize"
 TOKEN = os.environ.get("FANOLAB_API_KEY")
+TRANSCRIPT_FILE = "live_transcript.txt"  # Single file for all transcripts
 
 # audio settings
 SAMPLE_RATE = 16000
@@ -39,6 +40,16 @@ def audio_callback(indata, frames, time, status):
         print(f"Audio status: {status}")
     # PCM signed 16‑bit little endian
     audio_q.put(indata.copy())
+
+def update_transcript_file(text):
+    """Update the transcript file with new text."""
+    try:
+        with open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{text}\n")
+            f.flush()  # Ensure the file is written immediately
+        print(f"Transcript updated: {text}")
+    except Exception as e:
+        print(f"Error updating transcript file: {e}")
 
 async def recognize():
     """Connects to the WebSocket, streams audio, and saves transcripts."""
@@ -87,10 +98,7 @@ async def recognize():
                                 txt = alt.get("transcript", "")
                                 is_final = result.get("isFinal", False)
                                 if is_final and txt:
-                                    print(f"Transcript: {txt}")
-                                    if transcript_file:
-                                        transcript_file.write(f"{txt}\n")
-                                        transcript_file.flush()
+                                    update_transcript_file(txt)
             except websockets.exceptions.ConnectionClosed as e:
                 print(f"WebSocket connection closed: {e}")
             except Exception as e:
@@ -135,17 +143,14 @@ async def recognize():
         if stream:
             stream.stop()
             stream.close()
-        if transcript_file:
-            transcript_file.close()
 
 def start_recording():
     """Start the recording process."""
-    global is_streaming, transcript_file
+    global is_streaming
     
-    # Create a new transcript file with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"transcript_{timestamp}.txt"
-    transcript_file = open(filename, "w", encoding="utf-8")
+    # Clear the transcript file at the start of a new session
+    with open(TRANSCRIPT_FILE, "w", encoding="utf-8") as f:
+        f.write(f"=== New Recording Session - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")
     
     is_streaming = True
     
@@ -162,7 +167,7 @@ def start_recording():
         stream.close()
 
     threading.Thread(target=runner, daemon=True).start()
-    print(f"Recording started. Transcript will be saved to {filename}")
+    print(f"Recording started. Transcript is being saved to {TRANSCRIPT_FILE}")
     print("Press 'q' to stop recording...")
 
 def stop_recording():
@@ -170,11 +175,15 @@ def stop_recording():
     global is_streaming
     is_streaming = False
     print("Recording stopped.")
+    # Add a separator at the end of the session
+    with open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
+        f.write("\n=== End of Recording ===\n\n")
 
 def main():
     """Main function to run the transcription app."""
     print("Speech-to-Text Transcription App")
     print("Press 's' to start recording, 'q' to stop, 'x' to exit")
+    print(f"Transcripts will be saved to: {TRANSCRIPT_FILE}")
     
     keyboard.add_hotkey('s', start_recording)
     keyboard.add_hotkey('q', stop_recording)
