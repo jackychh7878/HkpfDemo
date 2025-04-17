@@ -1,4 +1,4 @@
-﻿streamlit
-sounddevice
+﻿sounddevice
 websockets
 load_dotenv
+keyboard
