@@ -1,3 +1,4 @@
 ﻿streamlit
 sounddevice
 websockets
+load_dotenv

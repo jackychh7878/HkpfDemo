@@ -7,6 +7,14 @@ import queue
 import json
 import base64
 import os
+import logging
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 if "streaming" not in st.session_state:
     st.session_state.streaming = False
@@ -37,71 +45,99 @@ async def recognize(is_streaming):
     transcript_box = st.empty()
     transcript = ""
 
-    async with websockets.connect(
-        WS_URL,
-        additional_headers={
-            "Authorization": f"Bearer {TOKEN}",
-            "fano-speech-disable-audio-conversion": "0",
-        },
-    ) as ws:
-        # Step 1: send config
-        cfg_msg = {
-            "event": "request",
-            "data": {
-                "streamingConfig": {
-                    "languageCode": "en",
-                    "sampleRateHertz": SAMPLE_RATE,
-                    "encoding": "LINEAR16",
-                    "enableAutomaticPunctuation": True,
-                    "interimResults": True
+    try:
+        logger.info("Attempting to connect to WebSocket...")
+        async with websockets.connect(
+            WS_URL,
+            additional_headers={
+                "Authorization": f"Bearer {TOKEN}",
+                "fano-speech-disable-audio-conversion": "0",
+            },
+            ping_interval=20,
+            ping_timeout=20,
+        ) as ws:
+            logger.info("WebSocket connection established")
+            
+            # Step 1: send config
+            cfg_msg = {
+                "event": "request",
+                "data": {
+                    "streamingConfig": {
+                        "config": {
+                            "languageCode": "yue",
+                            "sampleRateHertz": SAMPLE_RATE,
+                            "encoding": "LINEAR16",
+                            "enableAutomaticPunctuation": True,
+                            "singleUtterance": True
+                        }
+                    }
                 }
             }
-        }
-        await ws.send(json.dumps(cfg_msg))
+            # logger.info(f"Sending config: {json.dumps(cfg_msg)}")
+            await ws.send(json.dumps(cfg_msg))
 
-        # start background task to receive messages
-        async def recv_loop():
-            nonlocal transcript
-            async for message in ws:
-                msg = json.loads(message)
-                if msg.get("event") != "response":
+            # start background task to receive messages
+            async def recv_loop():
+                nonlocal transcript
+                try:
+                    async for message in ws:
+                        msg = json.loads(message)
+                        logger.info(f"Received message: {msg}")
+                        if msg.get("event") != "response":
+                            continue
+                        for result in msg["data"].get("results", []):
+                            for alt in result.get("alternative", []):
+                                txt = alt.get("transcript", "")
+                                is_final = result.get("isFinal", False)
+                                if is_final:
+                                    transcript += txt + " "
+                                else:
+                                    transcript_box.markdown(transcript + txt)
+                                print(transcript)
+                                transcript_box.markdown(transcript)
+                except websockets.exceptions.ConnectionClosed as e:
+                    logger.error(f"WebSocket connection closed: {e}")
+                except Exception as e:
+                    logger.error(f"Error in recv_loop: {e}")
+
+            recv_task = asyncio.create_task(recv_loop())
+
+            # Step 1b: stream audio until stopped
+            while True:
+                try:
+                    chunk = audio_q.get_nowait()
+                    # encode PCM bytes as base64
+                    b64 = base64.b64encode(chunk.tobytes()).decode("utf-8")
+                    audio_msg = {
+                        "event": "request",
+                        "data": {"audioContent": b64}
+                    }
+                    await ws.send(json.dumps(audio_msg))
+
+                    # break if we've somehow been signaled to stop
+                    if not is_streaming:
+                        break
+                except queue.Empty:
+                    await asyncio.sleep(0.01)
                     continue
-                for result in msg["data"].get("results", []):
-                    for alt in result.get("alternative", []):
-                        txt = alt.get("transcript", "")
-                        is_final = result.get("isFinal", False)
-                        # append or replace interim
-                        if is_final:
-                            transcript += txt + " "
-                        else:
-                            # show interim appended to final
-                            transcript_box.markdown(transcript + txt)
-                        transcript_box.markdown(transcript)
-        recv_task = asyncio.create_task(recv_loop())
+                except websockets.exceptions.ConnectionClosed as e:
+                    logger.error(f"WebSocket connection closed while sending audio: {e}")
+                    break
+                except Exception as e:
+                    logger.error(f"Error sending audio: {e}")
+                    break
 
-        # Step 1b: stream audio until stopped
-        while True:
+            # Step 2: send EOF to close stream gracefully
             try:
-                chunk = audio_q.get_nowait()
-            except queue.Empty:
-                await asyncio.sleep(0.01)
-                continue
-            # encode PCM bytes as base64
-            b64 = base64.b64encode(chunk.tobytes()).decode("utf-8")
-            audio_msg = {
-                "event": "request",
-                "data": {"audioContent": b64}
-            }
-            await ws.send(json.dumps(audio_msg))
+                eof_msg = {"event": "request", "data": "EOF"}
+                await ws.send(json.dumps(eof_msg))
+                await recv_task
+            except Exception as e:
+                logger.error(f"Error during cleanup: {e}")
 
-            # break if we’ve somehow been signaled to stop
-            if not is_streaming:
-                break
-
-        # Step 2: send EOF to close stream gracefully
-        eof_msg = {"event": "request", "data": "EOF"}
-        await ws.send(json.dumps(eof_msg))
-        await recv_task
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        st.error(f"An error occurred: {e}")
 
 def start_stream():
     """Called when user hits Start: kick off audio capture and asyncio task."""
