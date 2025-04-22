@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 import keyboard
 from datetime import datetime
 import tkinter as tk
-from tkinter import scrolledtext
+from tkinter import scrolledtext, ttk
 import queue as std_queue
 
 load_dotenv()
@@ -34,6 +34,7 @@ CHUNK_SIZE = 1024  # frames per buffer
 is_streaming = False
 transcript_queue = std_queue.Queue()
 audio_q = queue.Queue()  # Queue for audio data
+gui = None  # Global GUI instance
 
 def audio_callback(indata, frames, time, status):
     """This runs in a separate thread and puts raw bytes into the queue."""
@@ -48,6 +49,30 @@ class TranscriptGUI:
         self.root.title("Live Transcription")
         self.root.geometry("800x600")
         
+        # Create device selection frame
+        device_frame = tk.Frame(self.root)
+        device_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Device selection label
+        tk.Label(device_frame, text="Input Device:").pack(side=tk.LEFT)
+        
+        # Get available input devices
+        self.devices = sd.query_devices()
+        self.input_devices = [device for device in self.devices if device['max_input_channels'] > 0]
+        self.device_names = [f"{device['name']} (ID: {device['index']})" for device in self.input_devices]
+        
+        # Device selection dropdown
+        self.device_var = tk.StringVar()
+        self.device_dropdown = ttk.Combobox(device_frame, textvariable=self.device_var, values=self.device_names)
+        self.device_dropdown.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        # Set default device
+        default_device = sd.default.device[0]
+        for i, device in enumerate(self.input_devices):
+            if device['index'] == default_device:
+                self.device_dropdown.current(i)
+                break
+        
         # Create text widget with scrollbar
         self.text_widget = scrolledtext.ScrolledText(self.root, wrap=tk.WORD, font=("Arial", 12))
         self.text_widget.pack(expand=True, fill='both')
@@ -61,6 +86,14 @@ class TranscriptGUI:
         
         # Start the update loop
         self.update_text()
+    
+    def get_selected_device_index(self):
+        """Get the index of the currently selected device."""
+        selection = self.device_var.get()
+        for device in self.input_devices:
+            if f"{device['name']} (ID: {device['index']})" == selection:
+                return device['index']
+        return sd.default.device[0]  # Return default device if no selection
     
     def update_text(self):
         try:
@@ -117,7 +150,7 @@ async def recognize():
             "data": {
                 "streamingConfig": {
                     "config": {
-                        "languageCode": "yue-x-auto",
+                        "languageCode": "yue",
                         "sampleRateHertz": SAMPLE_RATE,
                         "encoding": "LINEAR16",
                         "enableAutomaticPunctuation": True,
@@ -187,7 +220,7 @@ async def recognize():
 
 def start_recording():
     """Start the recording process."""
-    global is_streaming
+    global is_streaming, gui
     
     # Clear the transcript file at the start of a new session
     with open(TRANSCRIPT_FILE, "w", encoding="utf-8") as f:
@@ -195,9 +228,13 @@ def start_recording():
     
     is_streaming = True
     
-    # start microphone capture
+    # Get the selected device index from the GUI
+    device_index = gui.get_selected_device_index()
+    
+    # start microphone capture with selected device
     sd.default.samplerate = SAMPLE_RATE
     sd.default.channels = CHANNELS
+    sd.default.device = device_index
     stream = sd.InputStream(callback=audio_callback, blocksize=CHUNK_SIZE, dtype='int16')
     stream.start()
 
@@ -208,7 +245,7 @@ def start_recording():
         stream.close()
 
     threading.Thread(target=runner, daemon=True).start()
-    print(f"Recording started. Transcript is being saved to {TRANSCRIPT_FILE}")
+    print(f"Recording started with device {device_index}. Transcript is being saved to {TRANSCRIPT_FILE}")
     print("Press 'q' to stop recording...")
 
 def stop_recording():
@@ -243,6 +280,8 @@ def keyboard_control():
 
 def main():
     """Main function to run the transcription app."""
+    global gui
+    
     # Start keyboard controls in a separate thread
     keyboard_thread = threading.Thread(target=keyboard_control, daemon=True)
     keyboard_thread.start()
