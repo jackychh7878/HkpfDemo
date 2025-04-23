@@ -150,7 +150,7 @@ async def recognize():
             "data": {
                 "streamingConfig": {
                     "config": {
-                        "languageCode": "yue",
+                        "languageCode": "yue-x-auto",
                         "sampleRateHertz": SAMPLE_RATE,
                         "encoding": "LINEAR16",
                         "enableAutomaticPunctuation": True,
