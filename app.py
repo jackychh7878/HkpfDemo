@@ -1,10 +1,8 @@
 import sounddevice as sd
 import asyncio
-import websockets
 import threading
 import queue
 import json
-import base64
 import os
 import logging
 from dotenv import load_dotenv
@@ -13,6 +11,8 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import scrolledtext, ttk
 import queue as std_queue
+import azure.cognitiveservices.speech as speechsdk
+from openai import AzureOpenAI
 
 load_dotenv()
 
@@ -21,9 +21,23 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ——— CONFIG ———
-WS_URL = "wss://portal-demo.fano.ai/speech/streaming-recognize"
-TOKEN = os.environ.get("FANOLAB_API_KEY")
+AZURE_KEY = os.environ.get("AZURE_SPEECH_KEY")
+AZURE_REGION = os.environ.get("AZURE_SPEECH_REGION")
+AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY")
+AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT")
 TRANSCRIPT_FILE = "live_transcript.txt"
+
+# System prompt for summarization
+SUMMARIZE_PROMPT = """You are a helpful assistant that summarizes conversations. 
+Your task is to:
+1. Read the conversation transcript
+2. Identify the main topics discussed
+3. Create a concise summary in the same language as the conversation
+4. Highlight any key points or decisions made
+5. Keep the summary clear and easy to understand
+
+Please provide the summary in the same language as the conversation."""
 
 # audio settings
 SAMPLE_RATE = 16000
@@ -35,6 +49,7 @@ is_streaming = False
 transcript_queue = std_queue.Queue()
 audio_q = queue.Queue()  # Queue for audio data
 gui = None  # Global GUI instance
+speech_recognizer = None
 
 def audio_callback(indata, frames, time, status):
     """This runs in a separate thread and puts raw bytes into the queue."""
@@ -125,102 +140,27 @@ def update_transcript(text):
     transcript_queue.put(text)
     print(f"Transcript updated: {text}")
 
-async def recognize():
-    """Connects to the WebSocket, streams audio, and saves transcripts."""
-    global is_streaming
-    ws = None
-    stream = None
-    
+def check_microphone():
+    """Check if microphone is available and accessible."""
     try:
-        print("Connecting to WebSocket...")
-        ws = await websockets.connect(
-            WS_URL,
-            additional_headers={
-                "Authorization": f"Bearer {TOKEN}",
-                "fano-speech-disable-audio-conversion": "0",
-            },
-            ping_interval=20,
-            ping_timeout=20,
-        )
-        print("WebSocket connection established")
-        
-        # Step 1: send config
-        cfg_msg = {
-            "event": "request",
-            "data": {
-                "streamingConfig": {
-                    "config": {
-                        "languageCode": "yue-x-auto",
-                        "sampleRateHertz": SAMPLE_RATE,
-                        "encoding": "LINEAR16",
-                        "enableAutomaticPunctuation": True,
-                        "singleUtterance": True
-                    }
-                }
-            }
-        }
-        await ws.send(json.dumps(cfg_msg))
-
-        # start background task to receive messages
-        async def recv_loop():
-            try:
-                async for message in ws:
-                    msg = json.loads(message)
-                    if msg.get("event") == "response" and "data" in msg:
-                        for result in msg["data"].get("results", []):
-                            for alt in result.get("alternatives", []):
-                                txt = alt.get("transcript", "")
-                                is_final = result.get("isFinal", False)
-                                if is_final and txt:
-                                    update_transcript(txt)
-            except websockets.exceptions.ConnectionClosed as e:
-                print(f"WebSocket connection closed: {e}")
-            except Exception as e:
-                print(f"Error in recv_loop: {e}")
-
-        recv_task = asyncio.create_task(recv_loop())
-
-        # Step 1b: stream audio until stopped
-        while is_streaming:
-            try:
-                chunk = audio_q.get_nowait()
-                # encode PCM bytes as base64
-                b64 = base64.b64encode(chunk.tobytes()).decode("utf-8")
-                audio_msg = {
-                    "event": "request",
-                    "data": {"audioContent": b64}
-                }
-                await ws.send(json.dumps(audio_msg))
-            except queue.Empty:
-                await asyncio.sleep(0.01)
-                continue
-            except websockets.exceptions.ConnectionClosed as e:
-                print(f"WebSocket connection closed while sending audio: {e}")
-                break
-            except Exception as e:
-                print(f"Error sending audio: {e}")
-                break
-
-        # Step 2: send EOF to close stream gracefully
-        try:
-            eof_msg = {"event": "request", "data": "EOF"}
-            await ws.send(json.dumps(eof_msg))
-            await recv_task
-        except Exception as e:
-            print(f"Error during cleanup: {e}")
-
+        # Try to get the default input device
+        device = sd.query_devices(kind='input')
+        if device is None:
+            print("No input device found")
+            return False
+        print(f"Found microphone: {device['name']}")
+        return True
     except Exception as e:
-        print(f"Unexpected error: {e}")
-    finally:
-        if ws:
-            await ws.close()
-        if stream:
-            stream.stop()
-            stream.close()
+        print(f"Error checking microphone: {e}")
+        return False
 
 def start_recording():
     """Start the recording process."""
-    global is_streaming, gui
+    global is_streaming, gui, speech_recognizer
+    
+    if not check_microphone():
+        print("Cannot start recording: No microphone available")
+        return
     
     # Clear the transcript file at the start of a new session
     with open(TRANSCRIPT_FILE, "w", encoding="utf-8") as f:
@@ -230,32 +170,94 @@ def start_recording():
     
     # Get the selected device index from the GUI
     device_index = gui.get_selected_device_index()
+    device_info = sd.query_devices(device_index)
     
-    # start microphone capture with selected device
-    sd.default.samplerate = SAMPLE_RATE
-    sd.default.channels = CHANNELS
-    sd.default.device = device_index
-    stream = sd.InputStream(callback=audio_callback, blocksize=CHUNK_SIZE, dtype='int16')
-    stream.start()
+    try:
+        # Configure speech recognition
+        speech_config = speechsdk.SpeechConfig(subscription=AZURE_KEY, region=AZURE_REGION)
+        speech_config.speech_recognition_language = "zh-HK"
+        
+        # Create audio config using default microphone
+        audio_config = speechsdk.audio.AudioConfig(use_default_microphone=True)
+        
+        # Create speech recognizer
+        speech_recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
+        
+        # Connect callbacks
+        speech_recognizer.recognized.connect(lambda evt: update_transcript(evt.result.text))
+        speech_recognizer.recognizing.connect(lambda evt: print(f"Recognizing: {evt.result.text}"))
+        speech_recognizer.canceled.connect(lambda evt: print(f"Canceled: {evt}"))
+        speech_recognizer.session_started.connect(lambda evt: print("Session started"))
+        speech_recognizer.session_stopped.connect(lambda evt: print("Session stopped"))
+        
+        # Start continuous recognition
+        speech_recognizer.start_continuous_recognition()
+        print(f"Recording started with device {device_info['name']}. Transcript is being saved to {TRANSCRIPT_FILE}")
+        print("Press 'q' to stop recording...")
+    except Exception as e:
+        print(f"Error starting recording: {e}")
+        is_streaming = False
+        if speech_recognizer:
+            speech_recognizer = None
 
-    # run the recognize coroutine in a new event loop
-    def runner():
-        asyncio.run(recognize())
-        stream.stop()
-        stream.close()
-
-    threading.Thread(target=runner, daemon=True).start()
-    print(f"Recording started with device {device_index}. Transcript is being saved to {TRANSCRIPT_FILE}")
-    print("Press 'q' to stop recording...")
+def get_conversation_summary():
+    """Get a summary of the conversation using Azure OpenAI."""
+    try:
+        # Read the transcript file
+        with open(TRANSCRIPT_FILE, "r", encoding="utf-8") as f:
+            transcript = f.read()
+        
+        # Initialize Azure OpenAI client
+        client = AzureOpenAI(
+            api_key=AZURE_OPENAI_KEY,
+            api_version="2024-12-01-preview",
+            azure_endpoint=AZURE_OPENAI_ENDPOINT
+        )
+        
+        # Create the chat completion
+        response = client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": SUMMARIZE_PROMPT},
+                {"role": "user", "content": f"Please summarize this conversation:\n\n{transcript}"}
+            ],
+            temperature=0.7,
+            max_tokens=500
+        )
+        
+        # Extract and return the summary
+        summary = response.choices[0].message.content
+        return summary
+    except Exception as e:
+        print(f"Error generating summary: {e}")
+        return "Error generating summary. Please check the logs for details."
 
 def stop_recording():
     """Stop the recording process."""
-    global is_streaming
+    global is_streaming, speech_recognizer
+    if speech_recognizer:
+        speech_recognizer.stop_continuous_recognition()
+        speech_recognizer = None
     is_streaming = False
     print("Recording stopped.")
+    
     # Add a separator at the end of the session
     with open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
         f.write("\n=== End of Recording ===\n\n")
+    
+    # Generate and add summary
+    print("Generating conversation summary...")
+    summary = get_conversation_summary()
+    with open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
+        f.write("\n=== Conversation Summary ===\n")
+        f.write(summary)
+        f.write("\n\n")
+    
+    # Update GUI with summary
+    transcript_queue.put("\n=== Conversation Summary ===\n")
+    transcript_queue.put(summary)
+    transcript_queue.put("\n")
+    print("Summary added to transcript.")
 
 def keyboard_control():
     """Handle keyboard controls in a separate thread."""
