@@ -1,13 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+import sys
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
 block_cipher = None
+
+# Get the path to the Azure Speech SDK DLL
+azure_speech_path = os.path.join(sys.prefix, 'Lib', 'site-packages', 'azure', 'cognitiveservices', 'speech')
+dll_path = os.path.join(azure_speech_path, 'Microsoft.CognitiveServices.Speech.core.dll')
 
 a = Analysis(
     ['app.py'],
     pathex=[],
-    binaries=[],
-    datas=[('.env', '.')],
-    hiddenimports=['azure.cognitiveservices.speech', 'openai', 'sounddevice', 'keyboard', 'python-dotenv', 'tkinter'],
+    binaries=[(dll_path, 'azure/cognitiveservices/speech')],
+    datas=collect_data_files('azure.cognitiveservices.speech'),
+    hiddenimports=collect_submodules('azure.cognitiveservices.speech'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -27,17 +35,17 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='SpeechTranscriber',
+    name='app',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,
+    console=True,
     disable_windowed_traceback=False,
+    argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None
 ) 
